@@ -1,18 +1,25 @@
 import cv2
 import os
+import numpy as np
 from datetime import datetime, timedelta
 
-# Configurações
+# Configurações de Diretório e Datas
 image_folder = 'selfies_alinhadas'
-output_video = 'video_com_datas.mp4'
-fps = 15
-initial_date = '2025-01-01'
+output_video = 'video_com_datas_youtube.mp4'
+fps = 20
+initial_date = '2020-06-11'
 date_format = '%b %d %Y'     # Formato: Jun 11 2020
 date_color = (255, 255, 255) # ⚪ branco
+
+# Configurações do YouTube (Full HD 16:9)
+yt_width = 1920
+yt_height = 1080
+
+# Ajustes da fonte (reduzidos pois a resolução final do vídeo é menor que a original)
 font = cv2.FONT_HERSHEY_SIMPLEX
-font_scale = 8
-thickness = 15
-margin_top = 250
+font_scale = 2
+thickness = 5
+margin_top = 100
 
 # Pega e ordena as imagens
 images = sorted(
@@ -25,24 +32,26 @@ if len(images) == 0:
 # Inicializa a data
 current_date = datetime.strptime(initial_date, '%Y-%m-%d')
 
-# Obtém o tamanho da imagem
+# Descobrir a proporção da imagem original para redimensionar corretamente
 first_image = cv2.imread(os.path.join(image_folder, images[0]))
-height, width, _ = first_image.shape
+orig_h, orig_w, _ = first_image.shape
 
-# Inicializa o VideoWriter
+# Calcula a nova largura para que a altura da foto encaixe perfeitamente nos 1080 pixels
+aspect_ratio = orig_w / orig_h
+new_w = int(yt_height * aspect_ratio)
+new_h = yt_height
+
+# Calcula a posição X para colar a foto bem no centro do fundo preto
+x_offset = (yt_width - new_w) // 2
+
+# Inicializa o VideoWriter com a resolução do YouTube
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-video = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+video = cv2.VideoWriter(output_video, fourcc, fps, (yt_width, yt_height))
 
-n_files = len(os.listdir(image_folder))
-i = 0
+n_files = len(images)
 
-# Itera sobre as imagens
-for img_name in images:
-    i += 1
-    print(f'{i}/{len(images)}')
-    
-    # if i == 6*31:
-    #     break
+for i, img_name in enumerate(images, start=1):
+    print(f'{i}/{n_files}')
 
     img_path = os.path.join(image_folder, img_name)
     img = cv2.imread(img_path)
@@ -53,26 +62,29 @@ for img_name in images:
         current_date += timedelta(days=1)
         continue
 
-    # ⚠️ Garante BGR
+    # ⚠️ Garante BGR e remove canal alpha se existir
     if len(img.shape) == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-    # ⚠️ Remove canal alpha se existir
     if img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-    # ⚠️ Garante tamanho correto
-    if img.shape[0] != height or img.shape[1] != width:
-        img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+    # 1. Redimensiona a selfie para caber na altura do YouTube
+    img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # Texto da data
+    # 2. Cria o "Canvas" preto em Full HD
+    canvas = np.zeros((yt_height, yt_width, 3), dtype=np.uint8)
+
+    # 3. Cola a selfie redimensionada no centro do canvas preto
+    canvas[0:yt_height, x_offset:x_offset+new_w] = img_resized
+
+    # Texto da data (Calculado sobre a largura do canvas inteiro para ficar no meio da tela)
     date_text = current_date.strftime(date_format)
     text_size = cv2.getTextSize(date_text, font, font_scale, thickness)[0]
-    text_x = (width - text_size[0]) // 2
+    text_x = (yt_width - text_size[0]) // 2
     text_y = margin_top
 
     cv2.putText(
-        img,
+        canvas,
         date_text,
         (text_x, text_y),
         font,
@@ -82,7 +94,8 @@ for img_name in images:
         cv2.LINE_AA
     )
 
-    video.write(img)
+    # Grava o frame (que agora é a tela preta com a foto colada em cima)
+    video.write(canvas)
     current_date += timedelta(days=1)
 
 # Finaliza o vídeo

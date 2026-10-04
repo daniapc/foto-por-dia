@@ -1,88 +1,130 @@
-import cv2
-import dlib
-import numpy as np
 import os
-from imutils import face_utils
+import cv2
+import numpy as np
 
-# Caminhos
-input_folder = 'selfies'
-output_folder = 'selfies_alinhadas'
-predictor_path = 'shape_predictor_68_face_landmarks.dat'
+# Trava para evitar Fork Bomb no Linux
+os.environ["OMP_NUM_THREADS"] = "1"
 
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(predictor_path)
+from mmpose.apis import MMPoseInferencer
 
-os.makedirs(output_folder, exist_ok=True)
+def main():
+    print("Inicializando MMPose para alinhamento...")
+    inferencer = MMPoseInferencer(pose2d='face')
+    print("MMPose carregado com sucesso!")
 
-ref_points = np.load('ref_points.npy')
+    # Caminhos
+    input_folder = 'fotos_2021'
+    output_folder = 'selfies_alinhadas'
+    os.makedirs(output_folder, exist_ok=True)
 
-# Índices: contorno + olhos + ponta do nariz (mesmo que na geração)
-contorno_indices = list(range(0, 17))
-olho_esq_indices = list(range(36, 42))
-olho_dir_indices = list(range(42, 48))
-nariz_indices = [30]
-selected_indices = contorno_indices + olho_esq_indices + olho_dir_indices + nariz_indices
+    # Carregar os pontos de referência salvos no script anterior
+    try:
+        ref_points = np.load('ref_points.npy')
+    except FileNotFoundError:
+        print("Erro: 'ref_points.npy' não encontrado. Rode o script de média primeiro!")
+        return
 
-target_width = 1944
-target_height = 2592
-target_size = (target_width, target_height)
+    target_width = 1944
+    target_height = 2592
+    target_size = (target_width, target_height)
 
-n_files = len(os.listdir(input_folder))
-i = 0
+    arquivos = [f for f in sorted(os.listdir(input_folder)) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    n_files = len(arquivos)
+    
+    if n_files == 0:
+        print("Nenhuma imagem encontrada.")
+        return
 
-for filename in sorted(os.listdir(input_folder)):
-    if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-        i += 1
-        print(f'{str(i)}/{str(n_files)}')
+    previous_frame = None
+    anchor_mean = None
+    anchor_std = None
+
+    for i, filename in enumerate(arquivos, start=1):
+        print(f'Alinhando imagem {i}/{n_files}: {filename}')
 
         image_path = os.path.join(input_folder, filename)
         image = cv2.imread(image_path)
 
-        image_resized = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
-
-        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-        sharpened = cv2.filter2D(image_resized, -1, kernel)
-
-        gray = cv2.cvtColor(sharpened, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
-
-        rects = detector(gray, 1)
-
-        if len(rects) == 0:
-            print(f"Nenhum rosto encontrado em {filename}")
+        if image is None:
+            print(f"Falha ao ler {filename}")
             continue
 
-        h, w = gray.shape
-        center_x, center_y = w // 2, h // 2
+        # Redimensionar para o tamanho fixo 
+        image_resized = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
 
-        def score(rect):
-            x = (rect.left() + rect.right()) / 2
-            y = (rect.top() + rect.bottom()) / 2
-            dist_to_center = ((x - center_x) ** 2 + (y - center_y) ** 2) ** 0.5
-            area = (rect.right() - rect.left()) * (rect.bottom() - rect.top())
-            return dist_to_center - 0.3 * area
+        # Inferência com MMPose
+        resultado_gen = inferencer(image_resized, show=False)
+        resultado = next(resultado_gen)
+        
+        predicoes = resultado['predictions'][0]
 
-        rect = min(rects, key=score)
+        if len(predicoes) == 0:
+            print(f"Nenhum rosto encontrado em {filename}. Usando frame anterior (se existir).")
+            if previous_frame is not None:
+                output_path = os.path.join(output_folder, filename)
+                cv2.imwrite(output_path, previous_frame)
+            continue
 
-        shape = predictor(gray, rect)
-        shape_np = face_utils.shape_to_np(shape)
+        # Pegar os pontos do primeiro rosto detectado
+        pontos = np.array(predicoes[0]['keypoints'], dtype=np.float32)
 
-        selected_points = shape_np[selected_indices]
+        # Calcular a matriz de transformação Afim
+        M, _ = cv2.estimateAffinePartial2D(pontos, ref_points)
 
-        M, _ = cv2.estimateAffinePartial2D(selected_points.astype(np.float32), ref_points)
+        if M is None:
+            print(f"Falha ao calcular transformação para {filename}")
+            continue
 
+        # Aplicar o alinhamento
         aligned = cv2.warpAffine(image_resized, M, target_size, flags=cv2.INTER_CUBIC)
 
-        mask_gray = np.full(gray.shape, 255, dtype=np.uint8)
+        # --- AJUSTE LEVE DE LUMINOSIDADE E CONTRASTE ---
+        aligned_lab = cv2.cvtColor(aligned, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(aligned_lab)
+        
+        if anchor_mean is None:
+            # Na primeira foto, guardamos a Média (brilho) e o Desvio Padrão (contraste)
+            anchor_mean = np.mean(l)
+            anchor_std = np.std(l)
+            aligned_adjusted = aligned.copy()
+        else:
+            l_mean = np.mean(l)
+            l_std = np.std(l)
+            
+            # Evita divisão por zero
+            if l_std == 0:
+                l_std = 1e-6
+            
+            # Ajuste linear suave: estica/encolhe o contraste e desloca o brilho
+            l_adjusted = (l - l_mean) * (anchor_std / l_std) + anchor_mean
+            
+            # Corta valores fora do limite 0-255 e volta para o formato de imagem
+            l_adjusted = np.clip(l_adjusted, 0, 255).astype(np.uint8)
+            
+            # Recombina com as cores originais (a, b) que ficaram 100% intocadas
+            lab_adjusted = cv2.merge((l_adjusted, a, b))
+            aligned_adjusted = cv2.cvtColor(lab_adjusted, cv2.COLOR_LAB2BGR)
+        # -----------------------------------------------
+
+        # Lógica de preenchimento de bordas usando a imagem com luz ajustada
+        mask_gray = np.full((target_height, target_width), 255, dtype=np.uint8)
         mask_warped = cv2.warpAffine(mask_gray, M, target_size, flags=cv2.INTER_NEAREST)
         mask_3ch = cv2.merge([mask_warped] * 3)
 
-        if 'previous_frame' not in locals():
-            previous_frame = aligned.copy()
+        if previous_frame is None:
+            previous_frame = aligned_adjusted.copy()
 
-        combined = np.where(mask_3ch == 255, aligned, previous_frame)
+        combined = np.where(mask_3ch == 255, aligned_adjusted, previous_frame)
+        
+        # Atualiza o frame anterior para a próxima iteração
         previous_frame = combined.copy()
 
+        # Salvar o resultado
         output_path = os.path.join(output_folder, filename)
         cv2.imwrite(output_path, combined)
+
+    print("\n=== PROCESSO CONCLUÍDO ===")
+    print(f"Imagens alinhadas salvas na pasta: {output_folder}")
+
+if __name__ == '__main__':
+    main()
